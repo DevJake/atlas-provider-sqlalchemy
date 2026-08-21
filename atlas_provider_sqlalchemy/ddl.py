@@ -39,6 +39,104 @@ def create_mock_engine(url: str, executor: Any) -> Any:
         return sa.create_mock_engine(url, executor)
 
 
+def resolve_package_module(file_path: Path) -> "tuple[str, Path] | None":
+    """Resolve a file inside a package to its dotted module name and import root.
+
+    Returns `None` for a file that is not part of a package, which is the
+    common case and keeps the path-based import below as the default.
+
+    A file whose directory holds an `__init__.py` belongs to a package, and
+    importing it under a synthetic top-level name strips it of that context, so
+    any relative import inside it fails. Walking up while `__init__.py` keeps
+    appearing finds the top-level package; its parent is the directory that
+    needs to be on `sys.path` for the dotted name to resolve.
+    """
+
+    if not (file_path.parent / "__init__.py").exists():
+        return None
+
+    parts = [] if file_path.name == "__init__.py" else [file_path.stem]
+    package = file_path.parent
+    while (package / "__init__.py").exists():
+        parts.append(package.name)
+        package = package.parent
+
+    return ".".join(reversed(parts)), package
+
+
+def import_module_from_path(file_path: Path, imported: "set[str]") -> "Any | None":
+    """Import a single file, preserving package context where there is any.
+
+    `imported` accumulates the dotted names already loaded during this walk, so
+    a package imported as a side effect of one of its submodules is not
+    executed a second time. Re-executing it would define the same models twice
+    against the same declarative base, which SQLAlchemy warns about and which
+    leaves the string-lookup table pointing at the later copy.
+    """
+
+    resolved = resolve_package_module(file_path)
+
+    if resolved is None:
+        # Not in a package: import by location under a unique name that
+        # includes the file's modification time, to avoid caching issues that
+        # can occur after git branch switches.
+        prefix = f"atlas_dynamic_module_{abs(hash(str(file_path.absolute())))}"
+        file_mtime = int(file_path.stat().st_mtime)
+        unique_module_name = f"{prefix}_{file_mtime}"
+
+        # Clear any existing module with similar names from sys.modules
+        for name in list(sys.modules):
+            if name.startswith(prefix):
+                del sys.modules[name]
+
+        # Also invalidate import caches to force fresh loading
+        importlib.invalidate_caches()
+
+        module_spec = importlib.util.spec_from_file_location(
+            unique_module_name,
+            file_path,
+        )
+        if module_spec is None or module_spec.loader is None:
+            return None
+        module = importlib.util.module_from_spec(module_spec)
+        module_spec.loader.exec_module(module)
+        return module
+
+    module_name, search_root = resolved
+
+    if module_name in imported:
+        return sys.modules.get(module_name)
+
+    root = str(search_root.absolute())
+    if root not in sys.path:
+        # Left in place for the rest of the walk rather than removed straight
+        # after the import: a model module may defer an import into a function
+        # body, and that has to keep resolving.
+        sys.path.insert(0, root)
+
+    # Drop any previous copy for the same reason as above -- a stale module
+    # cached from another branch would silently win over the file on disk.
+    for name in list(sys.modules):
+        is_this_module = name == module_name or name.startswith(f"{module_name}.")
+        if is_this_module and name not in imported:
+            del sys.modules[name]
+
+    importlib.invalidate_caches()
+
+    module = importlib.import_module(module_name)
+
+    # Importing a submodule executes its package too, so record everything that
+    # actually landed rather than just the name that was asked for.
+    imported.update(
+        name
+        for name in sys.modules
+        if name == module_name or name.startswith(f"{module_name.split('.')[0]}.")
+    )
+    imported.add(module_name)
+
+    return module
+
+
 def get_metadata(db_dir: Path, skip_errors: bool = False) -> sa.MetaData:
     """Walk the directory tree starting at the root, import all models and
     tables, and return metadata for one of them, as they all keep a reference
@@ -47,46 +145,38 @@ def get_metadata(db_dir: Path, skip_errors: bool = False) -> sa.MetaData:
     """
 
     metadata: set[sa.MetaData] = set()
+    imported: set[str] = set()
+    original_sys_path = list(sys.path)
 
-    for root, _, _ in os.walk(db_dir):
-        python_file_paths = Path(root).glob("*.py")
-        for file_path in python_file_paths:
-            try:
-                # Use a unique module name that includes file modification time
-                # to avoid caching issues that can occur after git branch switches
-                prefix = f"atlas_dynamic_module_{abs(hash(str(file_path.absolute())))}"
-                file_mtime = int(file_path.stat().st_mtime)
-                unique_module_name = f"{prefix}_{file_mtime}"
+    try:
+        for root, _, _ in os.walk(db_dir):
+            python_file_paths = Path(root).glob("*.py")
+            for file_path in python_file_paths:
+                try:
+                    module = import_module_from_path(file_path, imported)
+                except Exception as e:
+                    if skip_errors:
+                        print(
+                            f"Skipping {file_path}: {e.__class__.__name__}: {e!s}",
+                            file=sys.stderr,
+                        )
+                        continue
 
-                # Clear any existing module with similar names from sys.modules
-                for name in list(sys.modules):
-                    if name.startswith(prefix):
-                        del sys.modules[name]
+                    raise ModuleImportError(
+                        f"{e.__class__.__name__}: {str(e)} in {file_path}"
+                    )
 
-                # Also invalidate import caches to force fresh loading
-                importlib.invalidate_caches()
-
-                module_spec = importlib.util.spec_from_file_location(
-                    unique_module_name,
-                    file_path,
-                )
-                if module_spec and module_spec.loader:
-                    module = importlib.util.module_from_spec(module_spec)
-                    module_spec.loader.exec_module(module)
-            except Exception as e:
-                if skip_errors:
+                if module is None:
                     continue
 
-                raise ModuleImportError(
-                    f"{e.__class__.__name__}: {str(e)} in {file_path}"
-                )
-
-            ms = {
-                v.metadata
-                for (_, v) in inspect.getmembers(module)
-                if hasattr(v, "metadata") and isinstance(v.metadata, sa.MetaData)
-            }
-            metadata.update(ms)
+                ms = {
+                    v.metadata
+                    for (_, v) in inspect.getmembers(module)
+                    if hasattr(v, "metadata") and isinstance(v.metadata, sa.MetaData)
+                }
+                metadata.update(ms)
+    finally:
+        sys.path[:] = original_sys_path
 
     if not metadata:
         raise ModelsNotFoundError(

@@ -1,3 +1,4 @@
+import warnings
 from pathlib import Path
 
 import pytest
@@ -173,4 +174,53 @@ def test_get_metadata_invalid_models() -> None:
 def test_get_metadata_invalid_models_skip_errors() -> None:
     metadata = get_metadata(Path("tests/testdata/invalid_models"), skip_errors=True)
     assert isinstance(metadata, MetaData)
+    metadata.clear()
+
+
+@pytest.mark.skipif(
+    sqlalchemy_version() < (2, 0),
+    reason="requires SQLAlchemy>=2.0",
+)
+def test_get_metadata_package_with_relative_imports() -> None:
+    """Models in a package may import relatively (#27).
+
+    Importing each file under a synthetic top-level name stripped it of its
+    package context, so `from .base import Base` raised and the whole schema
+    was unreachable.
+    """
+    metadata = get_metadata(Path("tests/testdata/package_models"))
+    assert isinstance(metadata, MetaData)
+    assert {"notebook", "note"} <= set(metadata.tables)
+    metadata.clear()
+
+
+@pytest.mark.skipif(
+    sqlalchemy_version() < (2, 0),
+    reason="requires SQLAlchemy>=2.0",
+)
+def test_package_models_are_not_registered_twice() -> None:
+    """A package and its submodule must not both execute the model definitions.
+
+    Re-executing defines the same classes again against the same declarative
+    base, which leaves the string-lookup table pointing at the later copy.
+    """
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        metadata = get_metadata(Path("tests/testdata/package_models"))
+
+    duplicates = [w for w in caught if "already contains a class" in str(w.message)]
+    assert not duplicates, [str(w.message) for w in duplicates]
+    metadata.clear()
+
+
+def test_skip_errors_reports_what_it_skipped(capsys: CaptureFixture) -> None:
+    """`--skip-errors` must say what it dropped.
+
+    A silently truncated schema is worse than a loud failure: Atlas diffs the
+    database against the tables that did load and plans to drop the rest.
+    """
+    metadata = get_metadata(Path("tests/testdata/invalid_models"), skip_errors=True)
+    captured = capsys.readouterr()
+    assert "Skipping" in captured.err
+    assert "invalid_models.py" in captured.err
     metadata.clear()
